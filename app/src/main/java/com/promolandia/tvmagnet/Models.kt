@@ -21,6 +21,7 @@ object MagnetLink {
 
 data class VideoFile(val index: Int, val name: String, val path: String, val size: Long) : Serializable {
     val mimeType: String get() = mimeForName(name)
+    val isVideo: Boolean get() = mimeType.startsWith("video/")
     override fun toString(): String = "$name · ${formatBytes(size)}"
 }
 
@@ -35,13 +36,15 @@ fun mimeForName(name: String) = when (name.substringAfterLast('.', "").lowercase
     else -> "application/octet-stream"
 }
 
-enum class Phase { IDLE, METADATA, BUFFERING, READY, STREAMING, STOPPING, ERROR }
+enum class Phase { IDLE, METADATA, LISTED, BUFFERING, READY, STREAMING, STOPPING, ERROR }
 
 data class StreamState(
     val phase: Phase = Phase.IDLE,
     val title: String = "",
     val files: List<VideoFile> = emptyList(),
     val selectedIndex: Int = -1,
+    /** Largest video, preselected in the list; nothing streams until the user confirms. */
+    val suggestedIndex: Int = -1,
     val downloadedBytes: Long = 0,
     val totalBytes: Long = 0,
     val speedBytes: Long = 0,

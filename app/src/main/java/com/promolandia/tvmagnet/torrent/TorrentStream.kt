@@ -47,6 +47,7 @@ class TorrentStream(
     private var session: SessionManager? = null
     private var listener: AlertListener? = null
     private var filesInfo: FileStorage? = null
+    @Volatile private var infoHash: Sha1Hash? = null
     private var windowFrom = -1
     private var windowTo = -1
     private val startedAt = SystemClock.elapsedRealtime()
@@ -63,10 +64,17 @@ class TorrentStream(
                 override fun types(): IntArray? = null
                 override fun alert(alert: Alert<*>) {
                     when (alert.type()) {
-                        AlertType.ADD_TORRENT -> exec("Não consegui abrir esse magnet.") {
+                        AlertType.ADD_TORRENT -> {
+                            // Alert objects are only valid inside this callback: a TorrentHandle taken from an
+                            // alert and used later (v1.0.1 did) points at freed native memory -> SIGSEGV or
+                            // "invalid torrent handle". Copy the info-hash now, re-resolve the handle via find().
                             val added = alert as AddTorrentAlert
-                            val h = added.handle()?.takeIf { it.isValid() }
-                            if (added.error().value != 0 || h == null) fail("Não consegui abrir esse magnet.") else handle = h
+                            val failed = added.error().value != 0
+                            val hex = try { added.handle()?.infoHash()?.toHex() } catch (_: Throwable) { null }
+                            exec("Não consegui abrir esse magnet.") {
+                                if (failed || hex == null) fail("Não consegui abrir esse magnet.")
+                                else { infoHash = Sha1Hash.parseHex(hex); liveHandle() ?: fail("Não consegui abrir esse magnet.") }
+                            }
                         }
                         AlertType.METADATA_RECEIVED -> exec("Erro ao ler os arquivos do magnet.") { prepareFiles() }
                         AlertType.PIECE_FINISHED, AlertType.TORRENT_FINISHED -> signal()
@@ -79,7 +87,16 @@ class TorrentStream(
             }
             session = s; listener = l
             s.addListener(l)
-            s.start(SessionParams(SettingsPack().uploadRateLimit(8 * 1024)))
+            // The library's default start() sets the alert mask and DHT bootstrap nodes;
+            // a bare SettingsPack would leave alerts (and metadata) unreliable.
+            Breadcrumbs.mark(app, "libtorrent: iniciando sessão")
+            // Plain pread/pwrite storage instead of libtorrent 2.x's default memory-mapped files:
+            // mmap over a sparse cache file raises SIGBUS (an uncatchable native kill) as soon as
+            // the file is truncated/removed or the disk fills up.
+            val params = SessionParams().also { it.setPosixDiskIO() }
+            s.start(params)
+            runCatching { s.applySettings(s.settings().uploadRateLimit(8 * 1024)) }
+            Breadcrumbs.mark(app, "libtorrent: sessão iniciada")
             post(current.copy(phase = Phase.METADATA))
         }
     }
@@ -89,45 +106,69 @@ class TorrentStream(
         exec("Magnet inválido.") {
             post(current.copy(phase = Phase.METADATA, title = titleOf(magnet)))
             // Default storage is sparse: files grow as pieces arrive, never preallocated.
+            // Only the metadata is fetched here; files are set to "ignore" once it arrives.
+            Breadcrumbs.mark(app, "Buscar: adicionando magnet")
             session!!.download(magnet, buffer.root, torrent_flags_t())
         }
     }
 
+    /** Metadata arrived: list every file (videos first), download nothing yet. */
     private fun prepareFiles() {
-        val h = handle ?: return
+        val h = liveHandle() ?: return
         val storage = h.torrentFile()?.files() ?: return
-        if (stopped.get() || selected != null) return
-        val videos = (0 until storage.numFiles()).map { i ->
+        if (stopped.get() || current.files.isNotEmpty()) return
+        // Nothing meaningful may download before the user chooses a video. Keeping the peers interested
+        // (instead of ignoring every file) lets them stay connected; the 1 B/s cap makes the transfer negligible.
+        h.setDownloadLimit(1)
+        val all = (0 until storage.numFiles()).map { i ->
             val name = storage.filePath(i).replace('\\', '/').removePrefix("/")
             VideoFile(i, name.substringAfterLast('/'), name, storage.fileSize(i))
-        }.filter { it.mimeType.startsWith("video/") && it.size > 0 }
+        }.filter { it.size > 0 && !("/" + it.path).contains("/.pad/") }
+        val videos = all.filter { it.isVideo }.sortedByDescending { it.size }
         if (videos.isEmpty()) { fail("Não encontrei nenhum vídeo nesse magnet."); return }
+        val listed = (videos + all.filter { !it.isVideo }.sortedByDescending { it.size }).take(300)
         filesInfo = storage
-        post(current.copy(phase = Phase.BUFFERING, files = videos))
-        selectInternal(videos.maxBy { it.size }.index)
+        Breadcrumbs.mark(app, "Buscar: ${listed.size} arquivos listados")
+        post(current.copy(phase = Phase.LISTED, files = listed, suggestedIndex = videos.first().index, selectedIndex = -1,
+            title = (h.torrentFile()?.name() ?: "").ifBlank { current.title }))
     }
 
     fun select(fileIndex: Int) = exec("Erro ao preparar o streaming.") { selectInternal(fileIndex) }
 
     private fun selectInternal(fileIndex: Int) {
-        val file = current.files.firstOrNull { it.index == fileIndex } ?: return
+        val file = current.files.firstOrNull { it.index == fileIndex && it.isVideo } ?: return
+        Breadcrumbs.mark(app, "Transmitir: preparando arquivo $fileIndex")
         val fs = filesInfo ?: return
-        val h = handle ?: return
+        val h = liveHandle() ?: return
         active.set(null); onActive(null)
         selected = file; finished = false; readOffset = 0L; windowFrom = -1; windowTo = -1
         pieceLength = fs.pieceLength().toLong().coerceAtLeast(1)
         fileStart = fs.fileOffset(file.index)
         firstPiece = (fileStart / pieceLength).toInt()
         lastPiece = ((fileStart + file.size - 1) / pieceLength).toInt().coerceAtLeast(firstPiece)
-        h.prioritizeFiles(Array(fs.numFiles()) { if (it == file.index) Priority.DEFAULT else Priority.IGNORE })
+        // One scalar JNI call per file: the vector variant (prioritizeFiles) segfaults in
+        // libtorrent4j 2.1.0-39 (reproduced as SIGSEGV in torrent_handle.prioritize_files_ex).
+        for (i in 0 until fs.numFiles()) h.filePriority(i, if (i == file.index) Priority.DEFAULT else Priority.IGNORE)
         // Everything outside the window is ignored; the window moves with playback.
         for (i in firstPiece..lastPiece) h.piecePriority(i, Priority.IGNORE)
         for (i in (lastPiece - 2).coerceAtLeast(firstPiece)..lastPiece) h.piecePriority(i, Priority.TOP_PRIORITY)
         post(current.copy(phase = Phase.BUFFERING, title = file.name, selectedIndex = fileIndex, downloadedBytes = 0, totalBytes = file.size, clientConnected = false))
         moveWindow(firstPiece)
+        h.setFlags(TorrentFlags.SEQUENTIAL_DOWNLOAD)
+        h.setDownloadLimit(0)
         h.resume(); h.forceReannounce(0, -1)
         active.set(ActiveStream(file.name, file.mimeType, cacheFile(file), this).also(onActive))
         signal()
+    }
+
+    /** A handle that is valid right now, always obtained from the session (never from an alert). */
+    private fun liveHandle(): TorrentHandle? {
+        handle?.takeIf { it.isValid() }?.let { return it }
+        val hash = infoHash ?: return null
+        val found = session?.find(hash)?.takeIf { it.isValid() }
+        handle = found
+        if (found == null) Breadcrumbs.mark(app, "libtorrent: handle inválido")
+        return found
     }
 
     private fun cacheFile(file: VideoFile): File {
@@ -147,9 +188,10 @@ class TorrentStream(
         val lo = if (windowFrom < 0) start else minOf(windowFrom, start)
         val hi = if (windowTo < 0) end else maxOf(windowTo, end)
         for (i in lo..hi) {
-            val keep = i in start..end || i >= lastPiece - 2 || i < firstPiece + 2
-            h.piecePriority(i, if (keep) Priority.TOP_PRIORITY else Priority.IGNORE)
-            if (keep && i - start in 0..3 && !h.havePiece(i)) h.setPieceDeadline(i, 100 * (i - start))
+            val edge = i >= lastPiece - 2 || i < firstPiece + 2
+            val keep = i in start..end || edge
+            // Edges (container header/index) first; the window follows in sequential order.
+            h.piecePriority(i, if (edge) Priority.TOP_PRIORITY else if (keep) Priority.DEFAULT else Priority.IGNORE)
         }
         windowFrom = start; windowTo = end
     }
@@ -186,7 +228,10 @@ class TorrentStream(
 
     private fun sample() {
         val h = handle ?: run { timeoutCheck(); return }
-        val f = selected ?: run { timeoutCheck(); return }
+        val f = selected ?: run {
+            if (current.phase == Phase.METADATA || current.phase == Phase.LISTED) post(current.copy(peers = h.status().numPeers()))
+            timeoutCheck(); return
+        }
         buffer.ensureRoom(32L * 1024L * 1024L)
         // Slide the window with playback so the next pieces are requested early.
         ensureWindow(pieceAt(readOffset))
@@ -201,7 +246,7 @@ class TorrentStream(
     }
 
     private fun timeoutCheck() {
-        if (SystemClock.elapsedRealtime() - startedAt > 3 * 60_000) fail("Nenhum peer respondeu ao magnet em 3 minutos.")
+        if (current.phase == Phase.METADATA && SystemClock.elapsedRealtime() - startedAt > 3 * 60_000) fail("Não consegui ler o magnet em 3 minutos. Talvez não haja peers.")
     }
 
     private fun post(state: StreamState) { current = state; main.post { if (!stopped.get()) update(current) } }
@@ -234,6 +279,19 @@ class TorrentStream(
 
     fun activeFile() = active.get()
 
+    /** True when [offset, offset+length) of the chosen file is on disk. No side effects on the window. */
+    fun hasRange(offset: Long, length: Int): Boolean {
+        val h = handle ?: return false
+        val f = selected ?: return false
+        if (length <= 0 || f.size == 0L || stopped.get()) return false
+        val a = ((fileStart + offset) / pieceLength).toInt()
+        val b = ((fileStart + (offset + length - 1).coerceAtMost(f.size - 1)) / pieceLength).toInt()
+        return a >= firstPiece && b <= lastPiece && (a..b).all(h::havePiece)
+    }
+
+    /** Waits (off the main thread) for stop() to finish releasing the native session. */
+    fun awaitStopped(millis: Long) { runCatching { executor.awaitTermination(millis, java.util.concurrent.TimeUnit.MILLISECONDS) } }
+
     fun stop() {
         if (!stopped.compareAndSet(false, true)) return
         signal(); active.set(null); onActive(null)
@@ -243,7 +301,6 @@ class TorrentStream(
                 try { listener?.let { session?.removeListener(it) }; session?.stop() } catch (_: Throwable) {}
                 session = null; handle = null; filesInfo = null
                 buffer.clear()
-                main.post { update(StreamState()) }
                 executor.shutdown()
             }
         } catch (_: Throwable) { buffer.clear() }

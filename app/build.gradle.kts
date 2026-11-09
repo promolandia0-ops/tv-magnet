@@ -9,8 +9,8 @@ android {
         applicationId = "com.promolandia.tvmagnet"
         minSdk = 28
         targetSdk = 35
-        versionCode = 2
-        versionName = "1.0.1"
+        versionCode = 3
+        versionName = "1.0.2"
     }
     signingConfigs {
         create("release") {
@@ -34,13 +34,19 @@ android {
     kotlinOptions { jvmTarget = "17" }
     packaging { resources { excludes += setOf("META-INF/LICENSE.md", "META-INF/LICENSE-notice.md") } }
     sourceSets["main"].java.srcDir("src/main/kotlin")
-    testOptions { unitTests.isIncludeAndroidResources = true; unitTests.isReturnDefaultValues = true }
+    testOptions {
+        unitTests.isIncludeAndroidResources = true; unitTests.isReturnDefaultValues = true
+        // Opt-in end-to-end test (EndToEndTorrentTest): TVM_E2E_NATIVE_DIR points at a desktop libtorrent4j.so.
+        unitTests.all { it.jvmArgs("-Djava.library.path=" + (System.getenv("TVM_E2E_NATIVE_DIR") ?: "")) }
+    }
 }
 dependencies {
     val torrentVersion = "2.1.0-39"
     // Each artifact carries only its own ABI's libtorrent4j.so, so both can be combined.
     implementation("org.libtorrent4j:libtorrent4j-android-arm64:$torrentVersion")
     implementation("org.libtorrent4j:libtorrent4j-android-arm:$torrentVersion")
+    // Debug-only: lets the box emulator (x86_64) run the real native library. Never shipped in release.
+    debugImplementation("org.libtorrent4j:libtorrent4j-android-x86_64:$torrentVersion")
     implementation("org.nanohttpd:nanohttpd:2.3.1")
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("androidx.core:core-ktx:1.13.1")

@@ -29,18 +29,22 @@ class MainActivity : AppCompatActivity() {
     private lateinit var magnet: EditText
     private lateinit var tvSpinner: Spinner
     private lateinit var manualIp: EditText
-    private lateinit var primary: Button
+    private lateinit var searchButton: Button
+    private lateinit var castButton: Button
+    private lateinit var localButton: Button
+    private lateinit var filesLabel: TextView
+    private lateinit var filesGroup: RadioGroup
     private lateinit var pauseButton: Button
     private lateinit var status: TextView
     private lateinit var buffer: ProgressBar
-    private lateinit var fileSpinner: Spinner
     private lateinit var seek: SeekBar
     private lateinit var mediaPosition: TextView
 
     private var service: StreamService? = null
     private var bound = false
     private var tvList = listOf<TvDevice>()
-    private var videoList = listOf(VideoFile(-1, "O maior vídeo será escolhido", "", 0))
+    private var chosenIndex = -1
+    private var preparing = false
     private var updating = false
     private var seeking = false
     private var remotePlaying = false
@@ -61,7 +65,6 @@ class MainActivity : AppCompatActivity() {
             app.discovery.scanFresh()
             if (app.streaming) {
                 remotePlaying = true
-                primary.text = "Continuar na TV"
             }
             refreshButtons()
         }
@@ -91,10 +94,23 @@ class MainActivity : AppCompatActivity() {
         val name = text("TV Magnet", 30, TEXT); name.typeface = Typeface.DEFAULT_BOLD
         name.gravity = Gravity.CENTER
         content.addView(name)
-        content.addView(text("Cole o magnet. O vídeo toca direto na TV.", 14, MUTED).apply { gravity = Gravity.CENTER; setPadding(0, dp(4), 0, dp(14)) })
+        content.addView(text("1. Busque o magnet  2. Escolha o vídeo  3. Transmita pra TV", 14, MUTED).apply { gravity = Gravity.CENTER; setPadding(0, dp(4), 0, dp(14)) })
         content.addView(label("Link magnet"))
         magnet = input("magnet:?xt=urn:btih…")
         content.addView(magnet)
+        searchButton = button("Buscar", accent = true) { searchAction() }
+        content.addView(searchButton)
+        status = text("Cole o magnet e toque em Buscar.", 14, MUTED)
+        status.setPadding(0, dp(12), 0, dp(5))
+        content.addView(status)
+        buffer = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 100; layoutParams = LinearLayout.LayoutParams(-1, dp(8))
+        }
+        content.addView(buffer)
+        filesLabel = label("Arquivos do magnet (vídeos primeiro)").apply { visibility = View.GONE }
+        content.addView(filesLabel)
+        filesGroup = RadioGroup(this).apply { visibility = View.GONE }
+        content.addView(filesGroup)
         content.addView(label("Televisão"))
         tvSpinner = spinner().also(content::addView)
         tvSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
@@ -108,17 +124,10 @@ class MainActivity : AppCompatActivity() {
         manualIp.inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
         content.addView(manualIp)
         content.addView(button("Encontrar TV pelo IP", small = true) { manualSearch() })
-
-        primary = button("Tocar na TV", accent = true) { primaryAction() }
-        content.addView(primary)
-        content.addView(label("Progresso do stream"))
-        buffer = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
-            max = 100; layoutParams = LinearLayout.LayoutParams(-1, dp(8))
-        }
-        content.addView(buffer)
-        status = text("Escolha uma TV e toque em Tocar na TV.", 14, MUTED)
-        status.setPadding(0, dp(12), 0, dp(5))
-        content.addView(status)
+        castButton = button("Transmitir pra TV", accent = true) { castAction() }
+        content.addView(castButton)
+        localButton = button("Tocar no celular", small = true) { playLocally() }
+        content.addView(localButton)
 
         val controls = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         content.addView(controls, LinearLayout.LayoutParams(-1, -2))
@@ -126,13 +135,6 @@ class MainActivity : AppCompatActivity() {
         controls.addView(pauseButton, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = dp(8) })
         controls.addView(button("Parar e apagar", small = true) { stopEverything() }, LinearLayout.LayoutParams(0, -2, 1f))
 
-        fileSpinner = spinner().also(content::addView)
-        fileSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
-            override fun onItemSelected(parent: AdapterView<*>, view: View?, position: Int, id: Long) {
-                if (!updating) videoList.getOrNull(position)?.takeIf { it.index >= 0 }?.let { service?.chooseFile(it.index) }
-            }
-            override fun onNothingSelected(parent: AdapterView<*>?) {}
-        }
         content.addView(label("Posição na TV"))
         seek = SeekBar(this).apply {
             max = 1000
@@ -159,7 +161,6 @@ class MainActivity : AppCompatActivity() {
             override fun onStopTrackingTouch(s: SeekBar) { service?.volume(s.progress) { _, err -> if (err != null) runOnUiThread { toast(err) } } }
         })
         content.addView(volume)
-        content.addView(button("Tocar no celular", small = true) { playLocally() })
         content.addView(text("Mesmo Wi-Fi no celular e na TV.\nO cache temporário é apagado ao parar ou fechar o app.", 12, MUTED).apply { gravity = Gravity.CENTER; setPadding(0, dp(17), 0, dp(10)) })
         applyIntent(intent)
         lifecycleScope.launch { while (isActive) { delay(1_000); updatePosition() } }.also { uiJob = it }
@@ -171,29 +172,34 @@ class MainActivity : AppCompatActivity() {
         showLastCrash()
     }
 
-    private fun primaryAction() {
+    /** Step 1: metadata only. */
+    private fun searchAction() {
         if (!bound) return toast("Preparando o player… Tente novamente.")
         val app = service ?: return toast("Preparando o aplicativo…")
         val link = acceptMagnet(magnet.text)
         if (link == null) { status.text = "Cole um link magnet válido."; return }
-        if (app.currentlyPlaying || remotePlaying || remotePlayingRequested) return pauseAction()
-        val state = app.state.value
-        if (state.selectedIndex < 0) {
-            if (app.isStarting) return toast("Buscando o vídeo… Aguarde os peers.")
-            hideKeyboard()
-            app.startStream(link)?.let { message -> toast(message) } ?: run { status.text = "Buscando o vídeo… Aguarde os peers." }
-        } else {
-            val tv = tvList.getOrNull(tvSpinner.selectedItemPosition) ?: return toast("Escolha uma TV.")
-            app.play(tv) { error -> runOnUiThread {
-                remotePlayingRequested = false
-                pauseButton.isEnabled = error == null
-                lastError = error
-                if (error != null) status.text = error
-                refreshButtons()
-            } }
-            remotePlayingRequested = true
+        if (app.isStarting) return toast("Buscando… Aguarde os peers.")
+        hideKeyboard()
+        chosenIndex = -1; currentFilesKey = ""; remotePlaying = false; remotePlayingRequested = false
+        filesGroup.removeAllViews(); filesGroup.visibility = View.GONE; filesLabel.visibility = View.GONE
+        app.search(link)?.let { message -> toast(message) } ?: run { status.text = "Buscando... (peers: 0)" }
+        refreshButtons()
+    }
+
+    /** Step 2: send the chosen video to the TV. */
+    private fun castAction() {
+        val app = service ?: return toast("Preparando o aplicativo…")
+        if (chosenIndex < 0) return toast("Escolha um vídeo da lista.")
+        val tv = tvList.getOrNull(tvSpinner.selectedItemPosition) ?: return toast("Escolha uma TV.")
+        if (app.currentlyPlaying || remotePlaying) return pauseAction()
+        preparing = true; remotePlayingRequested = true
+        status.text = "Preparando o vídeo para a TV…"
+        refreshButtons()
+        app.cast(tv, chosenIndex) { error -> runOnUiThread {
+            preparing = false; remotePlayingRequested = false
+            if (error != null) status.text = error
             refreshButtons()
-        }
+        } }
     }
 
     private fun pauseAction() {
@@ -207,7 +213,6 @@ class MainActivity : AppCompatActivity() {
             else {
                 remotePlaying = !wasPlaying
                 pauseButton.text = if (remotePlaying) "Pausar" else "Continuar"
-                service?.streaming?.let { if (!it) primary.text = "Continuar na TV" }
             }
             refreshButtons()
         } }
@@ -228,9 +233,15 @@ class MainActivity : AppCompatActivity() {
 
     private fun playLocally() {
         val app = service ?: return
-        if (app.state.value.selectedIndex < 0) return toast("Aguarde encontrar o vídeo.")
-        val url = app.streamUrl() ?: return toast("Conecte ao Wi-Fi primeiro.")
-        startActivity(Intent(this, PlayerActivity::class.java).putExtra("url", url).putExtra("title", app.state.value.title))
+        if (chosenIndex < 0) return toast("Escolha um vídeo da lista.")
+        preparing = true; refreshButtons()
+        status.text = "Preparando o vídeo no celular…"
+        app.prepareLocal(chosenIndex) { url, error -> runOnUiThread {
+            preparing = false; refreshButtons()
+            if (url == null) { status.text = error ?: "Falha ao preparar o vídeo."; return@runOnUiThread }
+            try { startActivity(Intent(this, PlayerActivity::class.java).putExtra("url", url).putExtra("title", app.state.value.title)) }
+            catch (t: Throwable) { CrashReporter.capture(this, t); status.text = "Não consegui abrir o player." }
+        } }
     }
 
     private fun manualSearch() {
@@ -251,29 +262,45 @@ class MainActivity : AppCompatActivity() {
 
     private fun render(state: StreamState) {
         val percent = ((state.downloadedBytes.toDouble() / state.totalBytes.coerceAtLeast(1)) * 100).roundToInt().coerceIn(0, 100)
-        buffer.progress = percent; buffer.isIndeterminate = state.phase == Phase.METADATA
+        buffer.isIndeterminate = state.phase == Phase.METADATA
+        if (!buffer.isIndeterminate) buffer.progress = if (state.phase == Phase.LISTED) 0 else percent
         generatedStatus = when (state.phase) {
-            Phase.IDLE -> if (service?.streaming == true) "Transmitindo para a TV." else "Escolha uma TV e toque em Tocar na TV."
-            Phase.METADATA -> "Lendo o link… Isso depende dos peers."
+            Phase.IDLE -> if (service?.streaming == true) "Transmitindo para a TV." else "Cole o magnet e toque em Buscar."
+            Phase.METADATA -> "Buscando... (peers: ${state.peers})"
+            Phase.LISTED -> "${state.files.size} arquivos. Escolha o vídeo e transmita. (peers: ${state.peers})"
             Phase.BUFFERING -> "Buffer $percent% · ${formatBytes(state.downloadedBytes)} / ${formatBytes(state.totalBytes)}\n${formatSpeed(state.speedBytes)} · ${state.peers} peers"
-            Phase.READY, Phase.STREAMING -> "Pronto para tocar: ${state.title}"
+            Phase.READY, Phase.STREAMING -> "Pronto: ${state.title}"
             Phase.STOPPING -> "Apagando o cache…"
             Phase.ERROR -> state.error ?: "Não foi possível abrir o vídeo."
         }
-        if (!remotePlayingRequested && !remotePlaying) status.text = generatedStatus
-        val newFiles = state.files.ifEmpty { listOf(VideoFile(-1, "O maior vídeo será escolhido", "", 0)) }
-        val key = newFiles.joinToString { it.index.toString() }
+        if (!remotePlaying && (!remotePlayingRequested || state.phase == Phase.BUFFERING || state.phase == Phase.ERROR)) status.text = generatedStatus
+        val key = state.files.joinToString(",") { it.index.toString() }
         if (key != currentFilesKey) {
-            currentFilesKey = key; videoList = newFiles
+            currentFilesKey = key
+            filesGroup.removeAllViews()
+            chosenIndex = -1
+            val show = state.files.isNotEmpty()
+            filesLabel.visibility = if (show) View.VISIBLE else View.GONE
+            filesGroup.visibility = if (show) View.VISIBLE else View.GONE
             updating = true
-            fileSpinner.adapter = StringAdapter(this, newFiles.map { it.toString() })
-            if (state.selectedIndex >= 0) {
-                tvSpinner.isEnabled = true
-                fileSpinner.setSelection(newFiles.indexOfFirst { it.index == state.selectedIndex }.coerceAtLeast(0))
+            filesGroup.setOnCheckedChangeListener(null)
+            for (f in state.files) {
+                filesGroup.addView(RadioButton(this).apply {
+                    id = View.generateViewId(); tag = f.index
+                    text = if (f.isVideo) f.toString() else "${f}  (não é vídeo)"
+                    setTextColor(if (f.isVideo) TEXT else MUTED); isEnabled = f.isVideo; textSize = 14f
+                    buttonTintList = android.content.res.ColorStateList.valueOf(ACCENT)
+                    isChecked = f.index == state.suggestedIndex
+                })
+            }
+            if (state.suggestedIndex >= 0) chosenIndex = state.suggestedIndex
+            filesGroup.setOnCheckedChangeListener { group, checkedId ->
+                if (!updating) chosenIndex = (group.findViewById<View>(checkedId)?.tag as? Int) ?: -1
+                refreshButtons()
             }
             updating = false
         }
-        if (state.phase == Phase.ERROR && remotePlayingRequested) remotePlayingRequested = false
+        if (state.phase == Phase.ERROR) { remotePlayingRequested = false; preparing = false }
         refreshButtons()
     }
 
@@ -288,9 +315,17 @@ class MainActivity : AppCompatActivity() {
         if (duration > 0 && !seeking) seek.progress = ((app.remotePosition.toDouble() / duration) * 1000).toInt().coerceIn(0, 1000)
     }
     private fun refreshButtons() {
-        primary.text = if (remotePlayingRequested) "Aguarde…" else if (remotePlaying) "Pausar na TV" else "Tocar na TV"
+        val phase = service?.state?.value?.phase ?: Phase.IDLE
+        val searching = phase == Phase.METADATA
+        val listed = (service?.state?.value?.files?.isNotEmpty() == true) && chosenIndex >= 0
+        searchButton.isEnabled = !searching && !preparing
+        searchButton.text = if (searching) "Buscando…" else "Buscar"
+        castButton.text = if (remotePlayingRequested) "Aguarde…" else if (remotePlaying) "Pausar na TV" else "Transmitir pra TV"
+        castButton.isEnabled = !searching && (listed || remotePlaying) && !remotePlayingRequested
+        localButton.isEnabled = !searching && listed && !preparing
         pauseButton.text = if (remotePlaying) "Pausar" else "Continuar"
         pauseButton.isEnabled = !remotePlayingRequested && (remotePlaying || service?.remoteDuration ?: 0L > 0L)
+        listOf(searchButton, castButton, localButton, pauseButton).forEach { it.alpha = if (it.isEnabled) 1f else 0.4f }
     }
     private fun applyIntent(intent: Intent) { sharedMagnet(intent.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString(), intent.data)?.let(magnet::setText) }
     override fun onNewIntent(intent: Intent) { super.onNewIntent(intent); applyIntent(intent) }
@@ -317,7 +352,11 @@ class MainActivity : AppCompatActivity() {
 
     /** Shows the stack trace saved by the global crash handler during the previous run. */
     private fun showLastCrash() {
-        val report = CrashReporter.read(this) ?: return
+        val exit = ExitInfoReader.report(this)
+        val steps = Breadcrumbs.read(this)
+        val crash = CrashReporter.read(this)
+        if (exit == null && crash == null) return
+        val report = listOfNotNull(exit, steps?.let { "Últimos passos:\n$it" }, crash).joinToString("\n\n")
         val body = TextView(this).apply {
             text = report; textSize = 11f; typeface = Typeface.MONOSPACE; setTextIsSelectable(true); setPadding(dp(16), dp(8), dp(16), dp(8))
         }
@@ -326,9 +365,9 @@ class MainActivity : AppCompatActivity() {
             .setView(ScrollView(this).apply { addView(body) })
             .setPositiveButton("Copiar") { _, _ ->
                 (getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager).setPrimaryClip(ClipData.newPlainText("TV Magnet", report))
-                CrashReporter.clear(this)
+                CrashReporter.clear(this); Breadcrumbs.clear(this)
             }
-            .setNegativeButton("Fechar") { _, _ -> CrashReporter.clear(this) }
+            .setNegativeButton("Fechar") { _, _ -> CrashReporter.clear(this); Breadcrumbs.clear(this) }
             .show()
     }
     private fun label(content: String) = text(content, 13, MUTED).apply { setPadding(0, dp(9), 0, dp(6)) }

@@ -14,7 +14,7 @@ Standalone Android app for streaming your own magnet-linked videos to a DLNA TV 
 
 ## Use
 
-Choose your TV, paste the magnet link, and press **Tocar na TV**. The phone and TV must remain on the same Wi-Fi network, without client isolation. Playback depends on available peers/seeders, Wi-Fi routing, and the TV's codec/container support. One active video session. Adapter-specific Samsung quirks can affect seek, volume and MIME handling; a real Samsung TV is still required for end-to-end confirmation.
+Choose your TV, paste the magnet link, press **Buscar** to list the files, pick a video, then press **Transmitir pra TV** (or **Tocar no celular**). The phone and TV must remain on the same Wi-Fi network, without client isolation. Playback depends on available peers/seeders, Wi-Fi routing, and the TV's codec/container support. One active video session. Adapter-specific Samsung quirks can affect seek, volume and MIME handling; a real Samsung TV is still required for end-to-end confirmation.
 
 This app does not download or host shared videos itself, access a normal file library, or include videos or torrent links.
 
@@ -42,3 +42,6 @@ Current `v1.0.0`: all 22 JVM tests passed, including the Robolectric app-launch 
 - Release signature (v1/v2/v3 checked using the Android SDK tools), manifest permissions and packaged ARM native library.
 
 Dependency notices in `LICENSE-libtorrent4j.txt` and `LICENSE-NanoHTTPD.txt`. Third-party libs are requested directly from their Maven repositories, not copied from other projects.
+
+
+Current `v1.0.2`: fixes the native crash when starting playback (stale libtorrent handle from an alert), adds the two-step Buscar flow and a next-launch diagnostic from `ApplicationExitInfo`. See CRASH_INVESTIGATION_NOTES.md for what was and was not verified.

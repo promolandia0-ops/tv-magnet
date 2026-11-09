@@ -21,3 +21,6 @@ diagrams/
 app/.cxx/
 app/src/main/cpp/
 app/src/main/jniLibs/
+
+hs_err_pid*.log
+*.whl

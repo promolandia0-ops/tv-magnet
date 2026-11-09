@@ -23,6 +23,9 @@ class StreamService : Service() {
     private val torrentState = MutableStateFlow(StreamState())
     val state = torrentState.asStateFlow()
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+    /** All network, server and native work runs here, never on main. */
+    private val io = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val searching = AtomicBoolean(false)
     private val commands = Executors.newSingleThreadExecutor { Thread(it, "tv-commands").apply { isDaemon = true } }
     private val positionCommands = Executors.newSingleThreadExecutor { Thread(it, "tv-position").apply { isDaemon = true } }
     private val ticker = Handler(Looper.getMainLooper())
@@ -68,71 +71,138 @@ class StreamService : Service() {
     override fun onBind(intent: Intent?): IBinder = LocalBinder()
     fun selectTv(tv: TvDevice) { selectedTv = tv }
 
-    fun startStream(magnet: String): String? {
-        if (isStarting || torrent != null) return "Espere o vídeo atual ser preparado."
-        try {
-            isStarting = true
-            val server = http ?: return "Espere o aplicativo iniciar."
-            // TorrentStream loads the JNI library and constructs/starts its session
-            // exclusively inside torrent-native-control, away from this main thread.
-            val newTorrent = TorrentStream(this,
-                { active -> server.active = active },
-                { /* state exposes the localized error */ },
-                { state -> isStarting = state.phase != Phase.ERROR; torrentState.value = state; updateNotification(state) })
-            torrent = newTorrent
-            server.start(120_000, false)
-            newTorrent.start(magnet)
-            startTicker()
-            startCommandTimeout()
-            return null
-        } catch (e: Throwable) {
-            Log.e("TVMagnet", "Native stream initialization", e)
-            torrent?.stop(); torrent = null; http?.stop(); http = StreamServer()
-            isStarting = false
-            return "Não consegui iniciar o streaming neste celular. Digite o magnet novamente."
+    /** Step 1 ("Buscar"): metadata only. Nothing is downloaded or served yet. */
+    fun search(magnet: String): String? {
+        if (searching.getAndSet(true)) return "Espere a busca atual terminar."
+        isStarting = true
+        torrentState.value = StreamState(phase = Phase.METADATA, title = "")
+        io.launch {
+            try {
+                Breadcrumbs.mark(this@StreamService, "Buscar: início")
+                resetStreaming()
+                val newTorrent = TorrentStream(this@StreamService,
+                    { active -> http?.active = active },
+                    { /* state exposes the localized error */ },
+                    { state -> isStarting = state.phase == Phase.METADATA; torrentState.value = state; updateNotification(state) })
+                torrent = newTorrent
+                newTorrent.start(magnet)
+                withContext(Dispatchers.Main) { startTicker() }
+            } catch (e: Throwable) {
+                Log.e("TVMagnet", "Search failed", e)
+                CrashReporter.capture(this@StreamService, e)
+                isStarting = false
+                torrentState.value = StreamState(phase = Phase.ERROR, error = "Não consegui iniciar a busca neste celular. Veja o diagnóstico ao reabrir o app.")
+            } finally { searching.set(false) }
         }
+        return null
+    }
+
+    /** Drops any previous torrent and TV session before a new search. */
+    private fun resetStreaming() {
+        val old = torrent
+        torrent = null
+        streaming = false; playback = Playback.IDLE
+        lastPosition.set(0); knownDuration.set(0)
+        http?.active = null
+        if (old != null) { old.stop(); old.awaitStopped(8_000) }
     }
 
     fun manualTv(ip: String, callback: (TvDevice?, String) -> Unit) = discovery.manual(ip, callback)
-    fun chooseFile(index: Int) {
-        if (playback != Playback.IDLE) return
-        lastPosition.set(0); knownDuration.set(0)
-        torrent?.select(index)
+
+    private fun ensureServer(): StreamServer {
+        val server = http ?: throw IllegalStateException("Servidor local indisponível.")
+        if (!server.wasStarted()) {
+            Breadcrumbs.mark(this, "Servidor local: iniciando")
+            server.start(120_000, false)
+            Breadcrumbs.mark(this, "Servidor local: porta ${server.listeningPort}")
+        }
+        return server
     }
 
-    fun streamUrl(): String? {
+    fun streamUrl(local: Boolean = false): String? {
         val s = torrentState.value
         if (s.selectedIndex < 0) return null
         val h = http ?: return null
         if (!h.wasStarted()) return null
-        val ip = lanIp() ?: return null
+        val ip = if (local) "127.0.0.1" else (runCatching { lanIp() }.getOrNull() ?: return null)
         val extension = s.title.substringAfterLast('.', "mp4").lowercase()
         return "http://$ip:${h.listeningPort}/${h.token}/video.$extension"
     }
 
-    fun play(tv: TvDevice, callback: (String?) -> Unit = {}) {
-        selectedTv = tv
-        if (playback == Playback.PLAYING) { callback(null); return }
-        if (playback == Playback.STARTING) return
-        val url = streamUrl() ?: return callback("Conecte o celular e a TV ao mesmo Wi-Fi.")
-        val s = torrentState.value
-        val file = s.files.firstOrNull { it.index == s.selectedIndex } ?: return callback("Aguarde o vídeo ficar pronto.")
-        // The phone serves sparse data and waits for peers. Let it play immediately.
-        commands.execute {
+    /**
+     * Step 2: the chosen video. Starts the local server, selects the file and waits (on IO)
+     * for the first and last pieces so the TV/player does not time out. Every failure becomes a message.
+     */
+    private fun prepare(index: Int, local: Boolean, done: (String?, String?) -> Unit) {
+        io.launch {
             try {
-                val controller = RendererController(tv)
-                if (playback == Playback.PAUSED) controller.playAgain()
-                else {
-                    playback = Playback.STARTING
-                    controller.play(url, s.title, file.mimeType)
+                val t = torrent ?: return@launch done(null, "Busque o magnet primeiro.")
+                val file = torrentState.value.files.firstOrNull { it.index == index && it.isVideo }
+                    ?: return@launch done(null, "Escolha um arquivo de vídeo.")
+                if (!local && runCatching { lanIp() }.getOrNull() == null) return@launch done(null, "Conecte o celular e a TV ao mesmo Wi-Fi.")
+                ensureServer()
+                lastPosition.set(0); knownDuration.set(0)
+                t.select(index)
+                // The selection is applied on the native thread.
+                var waited = 0
+                while (t.activeFile() == null || torrentState.value.selectedIndex != index) {
+                    if (torrentState.value.phase == Phase.ERROR) return@launch done(null, torrentState.value.error)
+                    if (stopped || waited++ > 200) return@launch done(null, "Não consegui preparar o arquivo.")
+                    delay(100)
                 }
+                val head = minOf(file.size, 3L * 1024 * 1024).toInt()
+                val tail = minOf(file.size / 4, 1L * 1024 * 1024).toInt()
+                val limit = SystemClock.elapsedRealtime() + 120_000
+                while (!(t.hasRange(0, head) && (tail <= 0 || t.hasRange(file.size - tail, tail)))) {
+                    if (torrentState.value.phase == Phase.ERROR) return@launch done(null, torrentState.value.error)
+                    if (stopped) return@launch done(null, "Cancelado.")
+                    if (SystemClock.elapsedRealtime() > limit) return@launch done(null, "Poucos peers: o começo do vídeo não chegou em 2 minutos.")
+                    delay(500)
+                }
+                Breadcrumbs.mark(this@StreamService, "Buffer inicial pronto")
+                val url = streamUrl(local) ?: return@launch done(null, "Conecte o celular e a TV ao mesmo Wi-Fi.")
+                done(url, null)
+            } catch (e: CancellationException) { throw e
+            } catch (e: Throwable) {
+                Log.e("TVMagnet", "Prepare stream", e)
+                CrashReporter.capture(this@StreamService, e)
+                done(null, "Falha ao preparar o vídeo: ${e.message?.take(120) ?: e.javaClass.simpleName}")
+            }
+        }
+    }
+
+    /** "Tocar no celular": same preparation, then the caller opens the local player. */
+    fun prepareLocal(index: Int, callback: (String?, String?) -> Unit) = prepare(index, true, callback)
+
+    /** "Transmitir pra TV": prepare, then SetAVTransportURI + Play on the TV. */
+    fun cast(tv: TvDevice, index: Int, callback: (String?) -> Unit = {}) {
+        selectedTv = tv
+        if (playback == Playback.STARTING) return callback("Aguarde, preparando o vídeo.")
+        playback = Playback.STARTING
+        Breadcrumbs.mark(this, "Transmitir: início")
+        prepare(index, false) { url, error ->
+            if (url == null) { playback = Playback.IDLE; return@prepare callback(error ?: "Falha ao preparar o vídeo.") }
+            try {
+                val s = torrentState.value
+                val file = s.files.first { it.index == index }
+                Breadcrumbs.mark(this, "Transmitir: enviando URL à TV")
+                RendererController(tv).play(url, s.title, file.mimeType)
                 startStreamingNotification()
+                Breadcrumbs.mark(this, "Transmitir: TV tocando")
                 callback(null)
-            } catch (e: Exception) {
-                if (playback == Playback.STARTING) playback = Playback.IDLE
+            } catch (e: Throwable) {
+                playback = Playback.IDLE
                 Log.w("TVMagnet", "DLNA playback", e)
+                CrashReporter.capture(this, e)
                 callback("A TV não aceitou o comando. Confira o Wi-Fi e o formato do vídeo.")
             }
+        }
+    }
+
+    private fun resume(tv: TvDevice, callback: (String?) -> Unit) {
+        commands.execute {
+            try { RendererController(tv).playAgain(); startStreamingNotification(); callback(null) }
+            catch (e: Throwable) { callback("Não consegui continuar na TV.") }
         }
     }
 
@@ -162,7 +232,7 @@ class StreamService : Service() {
     fun pause(callback: (String?) -> Unit = {}) {
         val tv = selectedTv ?: return callback("Escolha uma TV.")
         when (playback) {
-            Playback.IDLE -> { play(tv, callback); return }
+            Playback.IDLE -> { callback("Toque em Transmitir pra TV."); return }
             Playback.STARTING, Playback.PLAYING -> commands.execute {
                 try {
                     // A Samsung may finish SetURI before Play on another network
@@ -173,7 +243,7 @@ class StreamService : Service() {
                     callback(null)
                 } catch (_: Exception) { callback("Não consegui pausar a TV.") }
             }
-            Playback.PAUSED -> play(tv, callback)
+            Playback.PAUSED -> resume(tv, callback)
         }
     }
 
@@ -218,21 +288,6 @@ class StreamService : Service() {
         })
     }
 
-    private fun startCommandTimeout() {
-        val id = sessionId
-        commands.execute {
-            for (i in 0 until 120) {
-                if (torrent?.activeFile() != null) break
-                try { Thread.sleep(1_000) } catch (_: InterruptedException) { return@execute }
-            }
-            if (id == sessionId && torrent?.activeFile() == null && !stopped) {
-                isStarting = false
-                torrentState.value = torrentState.value.copy(phase = Phase.ERROR,
-                    error = "Nenhum peer respondeu. O vídeo pode estar sem seeders.")
-            }
-        }
-    }
-
     private fun notification(text: String): Notification {
         val launch = PendingIntent.getActivity(this, 0, packageManager.getLaunchIntentForPackage(packageName), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
         val pending = PendingIntent.getService(this, 5, Intent(this, StreamService::class.java).setAction(STOP), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
@@ -248,7 +303,8 @@ class StreamService : Service() {
     }
     private fun updateNotification(state: StreamState) {
         val text = when (state.phase) {
-            Phase.METADATA -> "Buscando informações do link…"
+            Phase.METADATA -> "Buscando… (peers: ${state.peers})"
+            Phase.LISTED -> "Escolha o vídeo"
             Phase.ERROR -> state.error ?: "Falha na transmissão"
             else -> if (streaming) "Tocando na TV · ${state.peers} peers" else "Preparando · ${state.peers} peers · ${speed(state.speedBytes)}"
         }
@@ -275,7 +331,7 @@ class StreamService : Service() {
         // The torrent worker clears the buffer after native session/BIO release.
         // Android cache cleanup plus init cleanup handles process-level termination.
         if (::discovery.isInitialized) discovery.close()
-        scope.cancel(); stopForeground(STOP_FOREGROUND_REMOVE)
+        scope.cancel(); io.cancel(); stopForeground(STOP_FOREGROUND_REMOVE)
         super.onDestroy()
     }
     companion object {
