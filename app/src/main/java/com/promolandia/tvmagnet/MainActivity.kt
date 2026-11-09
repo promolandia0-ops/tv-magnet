@@ -163,13 +163,15 @@ class MainActivity : AppCompatActivity() {
         content.addView(text("Mesmo Wi-Fi no celular e na TV.\nO cache temporário é apagado ao parar ou fechar o app.", 12, MUTED).apply { gravity = Gravity.CENTER; setPadding(0, dp(17), 0, dp(10)) })
         applyIntent(intent)
         lifecycleScope.launch { while (isActive) { delay(1_000); updatePosition() } }.also { uiJob = it }
-        startOrBind(start = true)
+        // Ask for notifications first, but never wait for the answer: the foreground
+        // service works (with a hidden notification) even when it is denied.
         if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED)
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 33)
+        startOrBind(start = true)
+        showLastCrash()
     }
 
     private fun primaryAction() {
-        if (!bound) return toast("Preparando o player… Tente novamente.")
         if (!bound) return toast("Preparando o player… Tente novamente.")
         val app = service ?: return toast("Preparando o aplicativo…")
         val link = acceptMagnet(magnet.text)
@@ -306,12 +308,28 @@ class MainActivity : AppCompatActivity() {
         }
     }
     override fun onStart() { super.onStart(); if (!bound) startOrBind(start = false) }
-    override fun onStop() { if (bound) { if (bound) unbindService(connection)
-            bound = false; bound = false }; super.onStop() }
+    override fun onStop() { if (bound) { runCatching { unbindService(connection) }; bound = false }; super.onStop() }
     override fun onDestroy() { uiJob?.cancel(); super.onDestroy() }
     private fun startOrBind(start: Boolean) {
         if (start) StreamService.start(this)
-        bound = bindService(Intent(this, StreamService::class.java), connection, BIND_AUTO_CREATE)
+        bound = try { bindService(Intent(this, StreamService::class.java), connection, BIND_AUTO_CREATE) } catch (t: Throwable) { CrashReporter.capture(this, t); false }
+    }
+
+    /** Shows the stack trace saved by the global crash handler during the previous run. */
+    private fun showLastCrash() {
+        val report = CrashReporter.read(this) ?: return
+        val body = TextView(this).apply {
+            text = report; textSize = 11f; typeface = Typeface.MONOSPACE; setTextIsSelectable(true); setPadding(dp(16), dp(8), dp(16), dp(8))
+        }
+        androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle("O app fechou na última vez")
+            .setView(ScrollView(this).apply { addView(body) })
+            .setPositiveButton("Copiar") { _, _ ->
+                (getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager).setPrimaryClip(ClipData.newPlainText("TV Magnet", report))
+                CrashReporter.clear(this)
+            }
+            .setNegativeButton("Fechar") { _, _ -> CrashReporter.clear(this) }
+            .show()
     }
     private fun label(content: String) = text(content, 13, MUTED).apply { setPadding(0, dp(9), 0, dp(6)) }
     private fun text(content: String, size: Int, color: Int) = TextView(this).apply { text = content; textSize = size.toFloat(); setTextColor(color) }

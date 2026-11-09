@@ -1,6 +1,6 @@
 # TV Magnet
 
-Standalone Android app for streaming your own magnet-linked videos to a DLNA TV on the same Wi-Fi. Built for Android 9+ (arm64), Kotlin, libtorrent4j, NanoHTTPD and Media3/ExoPlayer.
+Standalone Android app for streaming your own magnet-linked videos to a DLNA TV on the same Wi-Fi. Built for Android 9+ (arm64 and armeabi-v7a), Kotlin, libtorrent4j, NanoHTTPD and Media3/ExoPlayer.
 
 - Paste a magnet, open a `magnet:` URI, or share plain text to TV Magnet.
 - Reads the clipboard on foreground (Android may limit this to the foreground app).
@@ -30,7 +30,7 @@ To sign a release, use the standard Android signing properties in your uncommitt
 
 ## Verification and limitations
 
-Current `v1.0.0`: all 22 JVM tests passed, including the Robolectric app-launch check. Release and debug builds were run with AGP 8.7.3, which supports compile SDK 35. No physical Android device or Samsung TV was available for runtime testing. Native libtorrent4j initialization, tracker/DHT connectivity, codec support and actual TV playback still need to be confirmed on hardware. This APK is arm64 only.
+Current `v1.0.0`: all 22 JVM tests passed, including the Robolectric app-launch check. Release and debug builds were run with AGP 8.7.3, which supports compile SDK 35. No physical Android device or Samsung TV was available for runtime testing. Native libtorrent4j initialization, tracker/DHT connectivity, codec support and actual TV playback still need to be confirmed on hardware. Release v1.0.1 ships both arm64-v8a and armeabi-v7a native libraries.
 
 ## Coverage
 

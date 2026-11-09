@@ -9,8 +9,8 @@ android {
         applicationId = "com.promolandia.tvmagnet"
         minSdk = 28
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 2
+        versionName = "1.0.1"
     }
     signingConfigs {
         create("release") {
@@ -38,10 +38,9 @@ android {
 }
 dependencies {
     val torrentVersion = "2.1.0-39"
-    // Each artifact contains only that ABI. They are intentionally not combined here:
-    // their duplicate libtorrent4j.so would corrupt one another during packaging.
-    val torrentAbi = (project.findProperty("torrentAbi") as String?) ?: "arm64"
-    implementation("org.libtorrent4j:libtorrent4j-android-$torrentAbi:$torrentVersion")
+    // Each artifact carries only its own ABI's libtorrent4j.so, so both can be combined.
+    implementation("org.libtorrent4j:libtorrent4j-android-arm64:$torrentVersion")
+    implementation("org.libtorrent4j:libtorrent4j-android-arm:$torrentVersion")
     implementation("org.nanohttpd:nanohttpd:2.3.1")
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("androidx.core:core-ktx:1.13.1")

@@ -3,227 +3,255 @@ package com.promolandia.tvmagnet.torrent
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
-import android.util.Log
+import android.os.SystemClock
 import com.promolandia.tvmagnet.*
 import org.libtorrent4j.*
 import org.libtorrent4j.alerts.*
-import org.libtorrent4j.swig.*
+import org.libtorrent4j.swig.remove_flags_t
+import org.libtorrent4j.swig.torrent_flags_t
 import java.io.File
 import java.util.concurrent.Executors
-import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
-/** One in-memory magnet session. Storage is exclusively temporary app-private cache. */
+/**
+ * One magnet session. Loading the native library, building the session and every
+ * libtorrent call run on the single "torrent-native-control" thread, never on main.
+ * Storage is private cache only, sparse (no preallocation), and only a bounded
+ * window of pieces around the playback position is requested.
+ */
 class TorrentStream(
-    private val context: Context,
+    context: Context,
     private val onActive: (ActiveStream?) -> Unit,
     private val onError: (String) -> Unit,
     private val update: (StreamState) -> Unit
 ) : PieceReader {
-    private val executor = Executors.newSingleThreadExecutor { r -> Thread(r, "torrent-control") }
+    private val app = context.applicationContext
+    private val buffer = TemporaryBuffer(app)
+    private val executor = Executors.newSingleThreadExecutor { Thread(it, "torrent-native-control") }
     private val lock = Object()
-    private val session: SessionManager
-    private val listener: AlertListener
-    private var handle: TorrentHandle? = null
+    private val main = Handler(Looper.getMainLooper())
+    private val stopped = AtomicBoolean(false)
+    private val started = AtomicBoolean(false)
+    private val active = AtomicReference<ActiveStream?>(null)
+    @Volatile private var current = StreamState()
+    @Volatile private var handle: TorrentHandle? = null
+    @Volatile private var selected: VideoFile? = null
+    @Volatile private var firstPiece = 0
+    @Volatile private var lastPiece = 0
+    @Volatile private var pieceLength = 1L
+    @Volatile private var fileStart = 0L
+    @Volatile private var readOffset = 0L
+    @Volatile private var finished = false
+    @Volatile private var fatal = false
+    private var session: SessionManager? = null
+    private var listener: AlertListener? = null
     private var filesInfo: FileStorage? = null
-    private var selected: VideoFile? = null
-    private var firstPiece = 0
-    private var lastPiece = 0
-    private var pieceLength = 1
-    private var priorityOffset = -1L
-    private var isStopped = false
-    private var currentState = StreamState()
-    private var active = AtomicReference<ActiveStream?>(null)
+    private var windowFrom = -1
+    private var windowTo = -1
+    private val startedAt = SystemClock.elapsedRealtime()
 
-    private val handler = Handler(Looper.getMainLooper())
-    override val error: String? get() = currentState.error
+    override val error: String? get() = current.error
+    override val fileLength: Long get() = selected?.size ?: 0L
 
     init {
-        System.loadLibrary("torrent4j")
-        val cache = File(context.cacheDir, "stream-buffer")
-        // Startup cleanup also handles Android killing the service process in background.
-        cache.deleteRecursively()
-        cache.mkdirs()
-        handler.post { update(currentState.copy(phase = Phase.METADATA)) }
-        session = SessionManager()
-        val settings = SettingsPack().uploadRateLimit(8 * 1024)
-        session.start(SessionParams(settings))
-        listener = object: AlertListener {
-            override fun types(): IntArray? = null
-            override fun alert(alert: Alert<*>) {
-            when (alert.type()) {
-                AlertType.ADD_TORRENT -> executor.execute {
-                    val added = alert as AddTorrentAlert
-                    val h = added.handle()?.takeIf { it.isValid() }
-                    if (added.error().value != 0 || h == null) fail("Não consegui abrir esse magnet.")
-                    else handle = h
+        exec("Não há uma biblioteca nativa compatível com este celular.") {
+            buffer.prepare(); buffer.ensureRoom()
+            System.loadLibrary("torrent4j")
+            val s = SessionManager()
+            val l = object : AlertListener {
+                override fun types(): IntArray? = null
+                override fun alert(alert: Alert<*>) {
+                    when (alert.type()) {
+                        AlertType.ADD_TORRENT -> exec("Não consegui abrir esse magnet.") {
+                            val added = alert as AddTorrentAlert
+                            val h = added.handle()?.takeIf { it.isValid() }
+                            if (added.error().value != 0 || h == null) fail("Não consegui abrir esse magnet.") else handle = h
+                        }
+                        AlertType.METADATA_RECEIVED -> exec("Erro ao ler os arquivos do magnet.") { prepareFiles() }
+                        AlertType.PIECE_FINISHED, AlertType.TORRENT_FINISHED -> signal()
+                        AlertType.TORRENT_ERROR, AlertType.FILE_ERROR -> exec("") {
+                            fail("O torrent foi interrompido. Verifique os seeds e o espaço livre do celular.")
+                        }
+                        else -> Unit
+                    }
                 }
-                AlertType.METADATA_RECEIVED -> executor.execute { prepareFiles() }
-                AlertType.PIECE_FINISHED, AlertType.TORRENT_FINISHED -> signal()
-                AlertType.TORRENT_ERROR -> fail("O torrent foi interrompido. Tente novamente.")
-                else -> Unit
             }
-            }
+            session = s; listener = l
+            s.addListener(l)
+            s.start(SessionParams(SettingsPack().uploadRateLimit(8 * 1024)))
+            post(current.copy(phase = Phase.METADATA))
         }
-        session.addListener(listener)
     }
 
     fun start(magnet: String) {
-        executor.execute {
-            try {
-                currentState = currentState.copy(phase = Phase.METADATA, title = MagnetLink.from(magnet)?.let { titleParam(it) } ?: "")
-                post()
-                session.download(magnet, File(context.cacheDir, "stream-buffer"), torrent_flags_t())
-            } catch (e: Exception) { fail(e.message ?: "Magnet inválido.") }
+        if (!started.compareAndSet(false, true)) return
+        exec("Magnet inválido.") {
+            post(current.copy(phase = Phase.METADATA, title = titleOf(magnet)))
+            // Default storage is sparse: files grow as pieces arrive, never preallocated.
+            session!!.download(magnet, buffer.root, torrent_flags_t())
         }
     }
-
-    private fun titleParam(uri: String) = UriParam.name(uri) ?: "Vídeo do magnet"
 
     private fun prepareFiles() {
-        try {
-            val h = handle ?: return
-            val storage = h.torrentFile()?.files() ?: return
-            if (isStopped) return
-            val video = (0 until storage.numFiles()).map { i ->
-                val name = storeName(storage.filePath(i))
-                VideoFile(i, name.substringAfterLast('/'), name, storage.fileSize(i))
-            }.filter(::isVideo)
-            if (video.isEmpty()) { fail("Não encontrei nenhum vídeo nesse magnet."); return }
-            filesInfo = storage
-            selected = video.maxBy { it.size }
-            currentState = currentState.copy(phase = Phase.BUFFERING, title = selected?.name ?: currentState.title, files = video, selectedIndex = selected?.index ?: -1)
-            post()
-            select(selected!!.index)
-        } catch (e: Exception) { fail(e.message ?: "Erro ao ler os arquivos do magnet.") }
+        val h = handle ?: return
+        val storage = h.torrentFile()?.files() ?: return
+        if (stopped.get() || selected != null) return
+        val videos = (0 until storage.numFiles()).map { i ->
+            val name = storage.filePath(i).replace('\\', '/').removePrefix("/")
+            VideoFile(i, name.substringAfterLast('/'), name, storage.fileSize(i))
+        }.filter { it.mimeType.startsWith("video/") && it.size > 0 }
+        if (videos.isEmpty()) { fail("Não encontrei nenhum vídeo nesse magnet."); return }
+        filesInfo = storage
+        post(current.copy(phase = Phase.BUFFERING, files = videos))
+        selectInternal(videos.maxBy { it.size }.index)
     }
 
-    fun select(fileIndex: Int) {
-        executor.execute {
-            try {
-                val file = currentState.files.firstOrNull { it.index == fileIndex } ?: return@execute
-                val h = handle ?: return@execute
-                active.set(null)
-                selected = file
-                currentState = currentState.copy(phase = Phase.BUFFERING, title = file.name, selectedIndex = fileIndex, downloadedBytes = 0, totalBytes = file.size, clientConnected = false)
-                post()
-                val fs = filesInfo ?: return@execute
-                pieceLength = fs.pieceLength()
-                firstPiece = (fs.fileOffset(file.index) / pieceLength).toInt()
-                lastPiece = ((fs.fileOffset(file.index) + file.size - 1) / pieceLength).toInt().coerceAtLeast(firstPiece)
-                h.prioritizeFiles(Array(fs.numFiles()) { i -> if (i == file.index) Priority.DEFAULT else Priority.IGNORE })
-                // Automatic queue management is disabled through the session.
-                h.setSequentialRange(firstPiece, lastPiece)
-                h.resume()
-                h.setSequentialRange(firstPiece, lastPiece)
-                // Tail pieces are prioritized for MP4/moov metadata, index recovery, and seeking.
-                // Promote first/tail pieces before resetting the native default priority;
-                // that avoids thousands of ignored-early callbacks for large videos.
-                for (i in firstPiece until (firstPiece + 4).coerceAtMost(lastPiece + 1)) h.piecePriority(i, Priority.TOP_PRIORITY)
-                for (i in (lastPiece - 2).coerceAtLeast(firstPiece)..lastPiece) h.piecePriority(i, Priority.TOP_PRIORITY)
-                // Clear library defaults one piece at a time: no allocation proportional to video size.
-                for (i in firstPiece..lastPiece) {
-                    if (i >= firstPiece + 4 && i < lastPiece - 2) h.piecePriority(i, Priority.DEFAULT)
-                }
-                for (i in firstPiece until (firstPiece + 4).coerceAtMost(lastPiece + 1)) h.setPieceDeadline(i, (i - firstPiece) * 100)
-                h.forceReannounce(0, -1) // obtains peers from omitted tracker after zero seconds
-                active.set(ActiveStream(file.name, file.mimeType, resolveCacheFile(fs.filePath(file.index)), this).also(onActive))
-                signal()
-            } catch (e: Exception) { fail(e.message ?: "Erro ao preparar o streaming.") }
-        }
+    fun select(fileIndex: Int) = exec("Erro ao preparar o streaming.") { selectInternal(fileIndex) }
+
+    private fun selectInternal(fileIndex: Int) {
+        val file = current.files.firstOrNull { it.index == fileIndex } ?: return
+        val fs = filesInfo ?: return
+        val h = handle ?: return
+        active.set(null); onActive(null)
+        selected = file; finished = false; readOffset = 0L; windowFrom = -1; windowTo = -1
+        pieceLength = fs.pieceLength().toLong().coerceAtLeast(1)
+        fileStart = fs.fileOffset(file.index)
+        firstPiece = (fileStart / pieceLength).toInt()
+        lastPiece = ((fileStart + file.size - 1) / pieceLength).toInt().coerceAtLeast(firstPiece)
+        h.prioritizeFiles(Array(fs.numFiles()) { if (it == file.index) Priority.DEFAULT else Priority.IGNORE })
+        // Everything outside the window is ignored; the window moves with playback.
+        for (i in firstPiece..lastPiece) h.piecePriority(i, Priority.IGNORE)
+        for (i in (lastPiece - 2).coerceAtLeast(firstPiece)..lastPiece) h.piecePriority(i, Priority.TOP_PRIORITY)
+        post(current.copy(phase = Phase.BUFFERING, title = file.name, selectedIndex = fileIndex, downloadedBytes = 0, totalBytes = file.size, clientConnected = false))
+        moveWindow(firstPiece)
+        h.resume(); h.forceReannounce(0, -1)
+        active.set(ActiveStream(file.name, file.mimeType, cacheFile(file), this).also(onActive))
+        signal()
     }
 
-    private fun resolveCacheFile(path: String): File {
-        val safe = path.replace('\\', '/').removePrefix("/")
-        val root = File(context.cacheDir, "stream-buffer").canonicalFile
-        val target = File(root, safe).canonicalFile
-        check(target.path.startsWith(root.path + File.separator)) { "Invalid torrent path" }
+    private fun cacheFile(file: VideoFile): File {
+        val root = buffer.root.canonicalFile
+        val target = File(root, file.path).canonicalFile
+        check(target.path.startsWith(root.path + File.separator)) { "Caminho do torrent inválido." }
         target.parentFile?.mkdirs()
-        // If metadata arrives before native allocation, an empty file is harmless as
-        // the stream blocks at have_piece until verified data is on disk.
         return target
     }
 
-    private fun pieceAt(offset: Long): Int {
-        val fs = filesInfo ?: return -1
-        val f = selected ?: return -1
-        return ((fs.fileOffset(f.index) + offset) / pieceLength).toInt()
+    /** Requests [from, from + window) with urgent deadlines at the front; clears the rest. */
+    private fun moveWindow(from: Int) {
+        val h = handle ?: return
+        val span = span()
+        val start = from.coerceIn(firstPiece, lastPiece)
+        val end = (start + span - 1).coerceAtMost(lastPiece)
+        val lo = if (windowFrom < 0) start else minOf(windowFrom, start)
+        val hi = if (windowTo < 0) end else maxOf(windowTo, end)
+        for (i in lo..hi) {
+            val keep = i in start..end || i >= lastPiece - 2 || i < firstPiece + 2
+            h.piecePriority(i, if (keep) Priority.TOP_PRIORITY else Priority.IGNORE)
+            if (keep && i - start in 0..3 && !h.havePiece(i)) h.setPieceDeadline(i, 100 * (i - start))
+        }
+        windowFrom = start; windowTo = end
     }
 
-    override val fileLength: Long get() = selected?.size ?: 0L
+    private fun span() = (WINDOW_BYTES / pieceLength).toInt().coerceIn(8, 1024)
+    private fun ensureWindow(piece: Int) {
+        if (piece < windowFrom || piece > windowFrom + span() / 2) moveWindow(piece - 1)
+    }
+
+    private fun pieceAt(offset: Long) = ((fileStart + offset) / pieceLength).toInt()
+
     override fun isAvailable(offset: Long, length: Int): Boolean {
         val h = handle ?: return false
-        if (fileLength == 0L) return false
+        if (fileLength == 0L || length <= 0) return false
+        readOffset = offset
         val a = pieceAt(offset); val b = pieceAt((offset + length - 1).coerceAtMost(fileLength - 1))
         if (a < firstPiece || b > lastPiece) return false
         return (a..b).all(h::havePiece)
     }
 
     override fun prioritize(offset: Long, length: Int) {
-        val h = handle ?: return
-        val a = (pieceAt(offset) - 1).coerceAtLeast(firstPiece)
-        val b = (pieceAt(offset + length - 1) + 12).coerceAtMost(lastPiece)
-        if (System.currentTimeMillis() - priorityOffset < 1_000) return
-        priorityOffset = System.currentTimeMillis()
-        for (i in a..b) h.piecePriority(i, Priority.TOP_PRIORITY)
-        h.setSequentialRange((pieceAt(offset) - 1).coerceAtLeast(firstPiece), lastPiece)
-        // TOP_PRIORITY is reserved for the tail; other playback pieces must not
-        // accidentally block the sequential range behind the current read point.
-        for (i in a..(a + 2).coerceAtMost(lastPiece)) h.setPieceDeadline(i, 100 * (i - a))
+        if (offset < 0 || offset >= fileLength || isStopped()) return
+        readOffset = offset
+        exec("") { if (selected != null) ensureWindow(pieceAt(readOffset)) }
     }
 
-    override fun complete(): Boolean = handle?.let { h -> (firstPiece..lastPiece).all(h::havePiece) } == true
+    override fun complete() = finished
     override fun signal() { synchronized(lock) { lock.notifyAll() } }
-    override fun throwIfStopped() { if (isStopped) throw InterruptedException("Stream stopped") }
-    override fun isStopped() = isStopped
+    override fun throwIfStopped() { if (isStopped()) throw InterruptedException("Stream encerrado") }
+    override fun isStopped() = stopped.get() || fatal
 
-    fun tick(): StreamState {
-        if (isStopped) return currentState
-        try {
-            val f = selected ?: return currentState
-            val h = handle ?: return currentState
-            val progress = h.fileProgress().getOrNull(f.index) ?: 0L
-            val status = h.status()
-            currentState = currentState.copy(downloadedBytes = progress, totalBytes = f.size,
-                speedBytes = status.downloadPayloadRate().toLong(), peers = status.numPeers(),
-                clientConnected = com.promolandia.tvmagnet.server.StreamServer.clientConnected)
-        } catch (_: Throwable) {}
-        return currentState
+    /** Called from the service ticker on main: only queues work onto the native thread. */
+    fun updateSnapshot() = exec("O streaming parou inesperadamente.") { sample() }
+
+    private fun sample() {
+        val h = handle ?: run { timeoutCheck(); return }
+        val f = selected ?: run { timeoutCheck(); return }
+        buffer.ensureRoom(32L * 1024L * 1024L)
+        // Slide the window with playback so the next pieces are requested early.
+        ensureWindow(pieceAt(readOffset))
+        val status = h.status()
+        val progress = (h.fileProgress().getOrNull(f.index) ?: 0L).coerceIn(0L, f.size)
+        finished = (firstPiece..lastPiece).all(h::havePiece)
+        var next = current.copy(downloadedBytes = progress, totalBytes = f.size,
+            speedBytes = status.downloadPayloadRate().toLong(), peers = status.numPeers(),
+            clientConnected = com.promolandia.tvmagnet.server.StreamServer.clientConnected)
+        if (finished && next.phase == Phase.BUFFERING) next = next.copy(phase = Phase.READY)
+        post(next)
     }
 
-    fun post() { val snapshot = tick(); handler.post { if (!isStopped) update(snapshot) } }
+    private fun timeoutCheck() {
+        if (SystemClock.elapsedRealtime() - startedAt > 3 * 60_000) fail("Nenhum peer respondeu ao magnet em 3 minutos.")
+    }
 
+    private fun post(state: StreamState) { current = state; main.post { if (!stopped.get()) update(current) } }
     private fun fail(message: String) {
-        currentState = currentState.copy(phase = Phase.ERROR, error = message)
-        onError(message)
-        post()
+        fatal = true
+        post(current.copy(phase = Phase.ERROR, error = message))
+        onError(message); signal(); active.set(null); onActive(null)
+    }
+
+    private fun friendly(t: Throwable, fallback: String) = when (t) {
+        is OutOfMemoryError -> "Memória insuficiente neste celular. Feche outros aplicativos e tente novamente."
+        is UnsatisfiedLinkError -> "Este aparelho não tem uma biblioteca nativa compatível. O diagnóstico foi salvo."
+        is BufferException -> t.message ?: fallback
+        else -> if (fallback.isNotEmpty()) fallback else "Falha ao reproduzir: ${t.message?.take(200) ?: t.javaClass.simpleName}"
+    }
+
+    /** Runs on the native thread; every Throwable (including JNI link errors) is reported, never fatal. */
+    private fun exec(message: String, action: () -> Unit) {
+        if (executor.isShutdown) return
+        try {
+            executor.execute {
+                if (stopped.get()) return@execute
+                try { action() } catch (t: Throwable) {
+                    CrashReporter.capture(app, t)
+                    if (message.isNotEmpty() || t is BufferException) fail(friendly(t, message))
+                }
+            }
+        } catch (_: java.util.concurrent.RejectedExecutionException) {}
     }
 
     fun activeFile() = active.get()
-    fun notifyComplete() { if (currentState.phase != Phase.READY && currentState.phase != Phase.STREAMING) { currentState = currentState.copy(phase = Phase.READY); post() } }
 
     fun stop() {
-        if (isStopped) return
-        isStopped = true
-        currentState = currentState.copy(phase = Phase.STOPPING)
-        signal()
-        executor.execute {
-            onActive(null)
-            try { handle?.let { session.remove(it, remove_flags_t.from_int(1)) } } catch (_: Throwable) {}
-            try { session.removeListener(listener); session.stop() } catch (_: Throwable) {}
-            try { File(context.cacheDir, "stream-buffer").deleteRecursively() } catch (_: Throwable) {}
-            active.set(null)
-            handler.post { currentState = StreamState(); update(currentState) }
-            executor.shutdown()
-        }
+        if (!stopped.compareAndSet(false, true)) return
+        signal(); active.set(null); onActive(null)
+        try {
+            executor.execute {
+                try { handle?.let { session?.remove(it, remove_flags_t.from_int(1)) } } catch (_: Throwable) {}
+                try { listener?.let { session?.removeListener(it) }; session?.stop() } catch (_: Throwable) {}
+                session = null; handle = null; filesInfo = null
+                buffer.clear()
+                main.post { update(StreamState()) }
+                executor.shutdown()
+            }
+        } catch (_: Throwable) { buffer.clear() }
     }
 
     companion object {
-        private fun isVideo(f: VideoFile) = f.mimeType.startsWith("video/")
-        private fun storeName(path: String) = path.replace('\\', '/').removePrefix("/")
+        private const val WINDOW_BYTES = 96L * 1024L * 1024L
+        private fun titleOf(uri: String) = Regex("""(?:^|[?&])dn=([^&]*)""").find(uri)?.groupValues?.get(1)
+            ?.replace('+', ' ')?.let { android.net.Uri.decode(it) } ?: "Vídeo do magnet"
     }
-}
-
-private object UriParam {
-    fun name(uri: String) = Regex("""(?:^|[?&])dn=([^&]*)""").find(uri)?.groupValues?.get(1)?.replace('+', ' ')?.let { android.net.Uri.decode(it) }
 }

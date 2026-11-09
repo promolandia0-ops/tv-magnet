@@ -8,7 +8,9 @@ import java.io.Serializable
 object MagnetLink {
     private val encodedHash = Regex("""xt=urn:btih:([A-Za-z0-9]{32}|[A-Fa-f0-9]{40})""")
 
-    fun from(raw: String?): String? {
+    fun from(raw: String?): String? = try { fromUnsafe(raw) } catch (_: Throwable) { null }
+
+    private fun fromUnsafe(raw: String?): String? {
         if (raw == null || raw.length > 32_768) return null
         return Regex("""magnet:\?[^\s]+""").find(raw.trim())?.value
             ?.replace("&amp;", "&")?.takeIf(encodedHash::containsMatchIn)

@@ -51,11 +51,18 @@ class StreamService : Service() {
         super.onCreate()
         http = StreamServer()
         createNotificationChannels()
-        // Must come before initializing native buffers/torrent: no FGS timeout on Samsung.
-        ServiceCompat.startForeground(this, 101, notification("Pronto para transmitir"),
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
-        discovery = RendererDiscovery(this)
-        selectedTv = discovery.initialTV()
+        // Must precede all discovery, HTTP and native setup on Android 14/15.
+        try {
+            ServiceCompat.startForeground(this, 101, notification("Pronto para transmitir"),
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
+            discovery = RendererDiscovery(this)
+            selectedTv = discovery.initialTV()
+        } catch (t: Throwable) {
+            Log.e("TVMagnet", "Foreground/discovery initialization", t)
+            CrashReporter.capture(this, t)
+            torrentState.value = StreamState(phase = Phase.ERROR, error = "Falha ao iniciar o serviço em segundo plano. Permita notificações e abra o app novamente.")
+            runCatching { http?.stop() }; stopSelf(); return
+        }
     }
 
     override fun onBind(intent: Intent?): IBinder = LocalBinder()
@@ -66,7 +73,8 @@ class StreamService : Service() {
         try {
             isStarting = true
             val server = http ?: return "Espere o aplicativo iniciar."
-            // libtorrent init can be expensive: do it off-thread but before any download.
+            // TorrentStream loads the JNI library and constructs/starts its session
+            // exclusively inside torrent-native-control, away from this main thread.
             val newTorrent = TorrentStream(this,
                 { active -> server.active = active },
                 { /* state exposes the localized error */ },
@@ -203,9 +211,8 @@ class StreamService : Service() {
             override fun run() {
                 if (stopped) return
                 val current = torrent ?: return
-                torrent?.let { torrentState.value = it.tick() }
-                updateNotification(torrentState.value)
-                if (current.complete()) current.notifyComplete()
+                    // status()/have_piece() are synchronous JNI calls: never on main.
+                current.updateSnapshot()
                 ticker.postDelayed(this, 1_000)
             }
         })
@@ -245,7 +252,8 @@ class StreamService : Service() {
             Phase.ERROR -> state.error ?: "Falha na transmissão"
             else -> if (streaming) "Tocando na TV · ${state.peers} peers" else "Preparando · ${state.peers} peers · ${speed(state.speedBytes)}"
         }
-        (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).notify(101, notification(text))
+        // Without POST_NOTIFICATIONS the notification is simply hidden; never let that throw.
+        try { (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).notify(101, notification(text)) } catch (_: Throwable) {}
     }
     private fun speed(bytes: Long) = if (bytes >= 1024 * 1024) "%.1f MB/s".format(bytes / 1024f / 1024f) else "${bytes / 1024} KB/s"
 
@@ -266,11 +274,14 @@ class StreamService : Service() {
         torrent?.stop()
         // The torrent worker clears the buffer after native session/BIO release.
         // Android cache cleanup plus init cleanup handles process-level termination.
-        discovery.close(); scope.cancel(); stopForeground(STOP_FOREGROUND_REMOVE)
+        if (::discovery.isInitialized) discovery.close()
+        scope.cancel(); stopForeground(STOP_FOREGROUND_REMOVE)
         super.onDestroy()
     }
     companion object {
         const val STOP = "com.promolandia.tvmagnet.STOP"
-        fun start(context: Context) { ContextCompat.startForegroundService(context, Intent(context, StreamService::class.java)) }
+        fun start(context: Context): Boolean = try {
+            ContextCompat.startForegroundService(context, Intent(context, StreamService::class.java)); true
+        } catch (t: Throwable) { CrashReporter.capture(context, t); false }
     }
 }
