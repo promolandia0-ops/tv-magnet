@@ -48,6 +48,10 @@ class TorrentStream(
     private var listener: AlertListener? = null
     private var filesInfo: FileStorage? = null
     @Volatile private var infoHash: Sha1Hash? = null
+    @Volatile private var headPieces = 2
+    @Volatile private var tailPieces = 2
+    @Volatile private var lastUrgentPiece = -1
+    @Volatile private var lastUrgentAt = 0L
     private var windowFrom = -1
     private var windowTo = -1
     private val startedAt = SystemClock.elapsedRealtime()
@@ -117,9 +121,6 @@ class TorrentStream(
         val h = liveHandle() ?: return
         val storage = h.torrentFile()?.files() ?: return
         if (stopped.get() || current.files.isNotEmpty()) return
-        // Nothing meaningful may download before the user chooses a video. Keeping the peers interested
-        // (instead of ignoring every file) lets them stay connected; the 1 B/s cap makes the transfer negligible.
-        h.setDownloadLimit(1)
         val all = (0 until storage.numFiles()).map { i ->
             val name = storage.filePath(i).replace('\\', '/').removePrefix("/")
             VideoFile(i, name.substringAfterLast('/'), name, storage.fileSize(i))
@@ -131,6 +132,29 @@ class TorrentStream(
         Breadcrumbs.mark(app, "Buscar: ${listed.size} arquivos listados")
         post(current.copy(phase = Phase.LISTED, files = listed, suggestedIndex = videos.first().index, selectedIndex = -1,
             title = (h.torrentFile()?.name() ?: "").ifBlank { current.title }))
+        // Bounded prefetch of the preselected video's first/last MB only: peers stay interested and
+        // playback starts fast, while no streaming, serving or full download happens before the user picks.
+        videos.first().let { prefetch(h, storage, it) }
+    }
+
+    private fun prefetch(h: TorrentHandle, fs: FileStorage, file: VideoFile) {
+        val pl = fs.pieceLength().toLong().coerceAtLeast(1)
+        val start = fs.fileOffset(file.index)
+        val first = (start / pl).toInt(); val last = ((start + file.size - 1) / pl).toInt().coerceAtLeast(first)
+        applyBase(h, fs, file.index, first, last, pl)
+    }
+
+    /** File priorities (scalar calls only) + piece priorities: head and tail first, everything else off. */
+    private fun applyBase(h: TorrentHandle, fs: FileStorage, fileIndex: Int, first: Int, last: Int, pl: Long) {
+        // One scalar JNI call per file: the vector variant (prioritizeFiles) segfaults in libtorrent4j 2.1.0-39.
+        for (i in 0 until fs.numFiles()) h.filePriority(i, if (i == fileIndex) Priority.DEFAULT else Priority.IGNORE)
+        val total = last - first + 1
+        headPieces = ((HEAD_BYTES + pl - 1) / pl).toInt().coerceIn(2, maxOf(2, total / 2))
+        tailPieces = ((TAIL_BYTES + pl - 1) / pl).toInt().coerceIn(2, maxOf(2, total / 2))
+        for (i in first..last) {
+            val edge = i < first + headPieces || i > last - tailPieces
+            h.piecePriority(i, if (edge) Priority.TOP_PRIORITY else Priority.IGNORE)
+        }
     }
 
     fun select(fileIndex: Int) = exec("Erro ao preparar o streaming.") { selectInternal(fileIndex) }
@@ -146,16 +170,11 @@ class TorrentStream(
         fileStart = fs.fileOffset(file.index)
         firstPiece = (fileStart / pieceLength).toInt()
         lastPiece = ((fileStart + file.size - 1) / pieceLength).toInt().coerceAtLeast(firstPiece)
-        // One scalar JNI call per file: the vector variant (prioritizeFiles) segfaults in
-        // libtorrent4j 2.1.0-39 (reproduced as SIGSEGV in torrent_handle.prioritize_files_ex).
-        for (i in 0 until fs.numFiles()) h.filePriority(i, if (i == file.index) Priority.DEFAULT else Priority.IGNORE)
-        // Everything outside the window is ignored; the window moves with playback.
-        for (i in firstPiece..lastPiece) h.piecePriority(i, Priority.IGNORE)
-        for (i in (lastPiece - 2).coerceAtLeast(firstPiece)..lastPiece) h.piecePriority(i, Priority.TOP_PRIORITY)
+        applyBase(h, fs, file.index, firstPiece, lastPiece, pieceLength)
         post(current.copy(phase = Phase.BUFFERING, title = file.name, selectedIndex = fileIndex, downloadedBytes = 0, totalBytes = file.size, clientConnected = false))
         moveWindow(firstPiece)
         h.setFlags(TorrentFlags.SEQUENTIAL_DOWNLOAD)
-        h.setDownloadLimit(0)
+        for (k in 0 until 8) { val i = firstPiece + k; if (i <= lastPiece && !h.havePiece(i)) h.setPieceDeadline(i, 250 * k) }
         h.resume(); h.forceReannounce(0, -1)
         active.set(ActiveStream(file.name, file.mimeType, cacheFile(file), this).also(onActive))
         signal()
@@ -188,7 +207,7 @@ class TorrentStream(
         val lo = if (windowFrom < 0) start else minOf(windowFrom, start)
         val hi = if (windowTo < 0) end else maxOf(windowTo, end)
         for (i in lo..hi) {
-            val edge = i >= lastPiece - 2 || i < firstPiece + 2
+            val edge = i > lastPiece - tailPieces || i < firstPiece + headPieces
             val keep = i in start..end || edge
             // Edges (container header/index) first; the window follows in sequential order.
             h.piecePriority(i, if (edge) Priority.TOP_PRIORITY else if (keep) Priority.DEFAULT else Priority.IGNORE)
@@ -203,19 +222,38 @@ class TorrentStream(
 
     private fun pieceAt(offset: Long) = ((fileStart + offset) / pieceLength).toInt()
 
+    // A piece that was verified stays verified: remember it so the HTTP reader doesn't make a blocking
+    // native round-trip (session lookup + have_piece) for every 64 KB it serves.
+    private val haveCache = java.util.concurrent.ConcurrentHashMap.newKeySet<Int>()
+    private fun have(h: TorrentHandle, i: Int): Boolean = i in haveCache || (h.havePiece(i) && haveCache.add(i).let { true })
+
     override fun isAvailable(offset: Long, length: Int): Boolean {
-        val h = handle ?: return false
         if (fileLength == 0L || length <= 0) return false
         readOffset = offset
         val a = pieceAt(offset); val b = pieceAt((offset + length - 1).coerceAtMost(fileLength - 1))
         if (a < firstPiece || b > lastPiece) return false
-        return (a..b).all(h::havePiece)
+        if ((a..b).all { it in haveCache }) return true
+        val h = handle ?: return false
+        return (a..b).all { have(h, it) }
     }
 
     override fun prioritize(offset: Long, length: Int) {
         if (offset < 0 || offset >= fileLength || isStopped()) return
         readOffset = offset
-        exec("") { if (selected != null) ensureWindow(pieceAt(readOffset)) }
+        val piece = pieceAt(offset); val now = SystemClock.elapsedRealtime()
+        if (piece == lastUrgentPiece && now - lastUrgentAt < 1_500) return
+        lastUrgentPiece = piece; lastUrgentAt = now
+        exec("") { if (selected != null) { ensureWindow(piece); urgent(piece) } }
+    }
+
+    /** The reader is blocked on [piece]: top priority + short deadlines on the next few pieces. */
+    private fun urgent(piece: Int) {
+        val h = handle ?: return
+        for (k in 0 until 8) {
+            val i = piece + k
+            if (i > lastPiece) break
+            if (!h.havePiece(i)) { h.piecePriority(i, Priority.TOP_PRIORITY); h.setPieceDeadline(i, 300 * k) }
+        }
     }
 
     override fun complete() = finished
@@ -237,8 +275,14 @@ class TorrentStream(
         ensureWindow(pieceAt(readOffset))
         val status = h.status()
         val progress = (h.fileProgress().getOrNull(f.index) ?: 0L).coerceIn(0L, f.size)
-        finished = (firstPiece..lastPiece).all(h::havePiece)
-        var next = current.copy(downloadedBytes = progress, totalBytes = f.size,
+        finished = (firstPiece..lastPiece).all { have(h, it) }
+        var ahead = 0L
+        run {
+            val from = pieceAt(readOffset); var p = from; var n = 0
+            while (p <= lastPiece && n < 64 && have(h, p)) { p++; n++ }
+            ahead = (minOf((p - from).toLong() * pieceLength - (fileStart + readOffset) % pieceLength, f.size - readOffset)).coerceAtLeast(0)
+        }
+        var next = current.copy(downloadedBytes = progress, totalBytes = f.size, bufferedAhead = ahead,
             speedBytes = status.downloadPayloadRate().toLong(), peers = status.numPeers(),
             clientConnected = com.promolandia.tvmagnet.server.StreamServer.clientConnected)
         if (finished && next.phase == Phase.BUFFERING) next = next.copy(phase = Phase.READY)
@@ -286,7 +330,7 @@ class TorrentStream(
         if (length <= 0 || f.size == 0L || stopped.get()) return false
         val a = ((fileStart + offset) / pieceLength).toInt()
         val b = ((fileStart + (offset + length - 1).coerceAtMost(f.size - 1)) / pieceLength).toInt()
-        return a >= firstPiece && b <= lastPiece && (a..b).all(h::havePiece)
+        return a >= firstPiece && b <= lastPiece && (a..b).all { have(h, it) }
     }
 
     /** Waits (off the main thread) for stop() to finish releasing the native session. */
@@ -308,6 +352,8 @@ class TorrentStream(
 
     companion object {
         private const val WINDOW_BYTES = 96L * 1024L * 1024L
+        private const val HEAD_BYTES = 6L * 1024L * 1024L
+        private const val TAIL_BYTES = 2L * 1024L * 1024L
         private fun titleOf(uri: String) = Regex("""(?:^|[?&])dn=([^&]*)""").find(uri)?.groupValues?.get(1)
             ?.replace('+', ' ')?.let { android.net.Uri.decode(it) } ?: "Vídeo do magnet"
     }

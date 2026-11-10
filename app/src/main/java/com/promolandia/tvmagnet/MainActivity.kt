@@ -263,12 +263,21 @@ class MainActivity : AppCompatActivity() {
     private fun render(state: StreamState) {
         val percent = ((state.downloadedBytes.toDouble() / state.totalBytes.coerceAtLeast(1)) * 100).roundToInt().coerceIn(0, 100)
         buffer.isIndeterminate = state.phase == Phase.METADATA
-        if (!buffer.isIndeterminate) buffer.progress = if (state.phase == Phase.LISTED) 0 else percent
+        if (!buffer.isIndeterminate) buffer.progress = when {
+            state.phase == Phase.LISTED -> 0
+            state.phase == Phase.BUFFERING && state.bufferedAhead < minOf(state.totalBytes, StreamService.PREBUFFER_BYTES) ->
+                (state.bufferedAhead * 100 / minOf(state.totalBytes, StreamService.PREBUFFER_BYTES).coerceAtLeast(1)).toInt()
+            else -> percent
+        }
         generatedStatus = when (state.phase) {
             Phase.IDLE -> if (service?.streaming == true) "Transmitindo para a TV." else "Cole o magnet e toque em Buscar."
             Phase.METADATA -> "Buscando... (peers: ${state.peers})"
             Phase.LISTED -> "${state.files.size} arquivos. Escolha o vídeo e transmita. (peers: ${state.peers})"
-            Phase.BUFFERING -> "Buffer $percent% · ${formatBytes(state.downloadedBytes)} / ${formatBytes(state.totalBytes)}\n${formatSpeed(state.speedBytes)} · ${state.peers} peers"
+            Phase.BUFFERING -> {
+                val target = minOf(state.totalBytes, StreamService.PREBUFFER_BYTES).coerceAtLeast(1)
+                if (state.bufferedAhead < target) "Carregando o início: ${formatBytes(state.bufferedAhead)} de ${formatBytes(target)} (${(state.bufferedAhead * 100 / target).toInt()}%)\n${formatSpeed(state.speedBytes)} · ${state.peers} peers"
+                else "Buffer $percent% do arquivo · ${formatBytes(state.bufferedAhead)} à frente\n${formatSpeed(state.speedBytes)} · ${state.peers} peers"
+            }
             Phase.READY, Phase.STREAMING -> "Pronto: ${state.title}"
             Phase.STOPPING -> "Apagando o cache…"
             Phase.ERROR -> state.error ?: "Não foi possível abrir o vídeo."

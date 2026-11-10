@@ -150,14 +150,15 @@ class StreamService : Service() {
                     if (stopped || waited++ > 200) return@launch done(null, "Não consegui preparar o arquivo.")
                     delay(100)
                 }
-                val head = minOf(file.size, 3L * 1024 * 1024).toInt()
-                val tail = minOf(file.size / 4, 1L * 1024 * 1024).toInt()
-                val limit = SystemClock.elapsedRealtime() + 120_000
-                while (!(t.hasRange(0, head) && (tail <= 0 || t.hasRange(file.size - tail, tail)))) {
+                // Only the start is needed to begin: players ask for the index (mp4 moov) themselves and the
+                // server then blocks (with deadlines on those pieces) instead of this screen waiting for the whole tail.
+                val head = minOf(file.size, PREBUFFER_BYTES).toInt()
+                val limit = SystemClock.elapsedRealtime() + 150_000
+                while (!t.hasRange(0, head)) {
                     if (torrentState.value.phase == Phase.ERROR) return@launch done(null, torrentState.value.error)
                     if (stopped) return@launch done(null, "Cancelado.")
-                    if (SystemClock.elapsedRealtime() > limit) return@launch done(null, "Poucos peers: o começo do vídeo não chegou em 2 minutos.")
-                    delay(500)
+                    if (SystemClock.elapsedRealtime() > limit) return@launch done(null, "Poucos peers: o começo do vídeo não chegou em 2,5 minutos. Tente outro magnet.")
+                    delay(300)
                 }
                 Breadcrumbs.mark(this@StreamService, "Buffer inicial pronto")
                 val url = streamUrl(local) ?: return@launch done(null, "Conecte o celular e a TV ao mesmo Wi-Fi.")
@@ -335,6 +336,7 @@ class StreamService : Service() {
         super.onDestroy()
     }
     companion object {
+        const val PREBUFFER_BYTES = 2L * 1024 * 1024
         const val STOP = "com.promolandia.tvmagnet.STOP"
         fun start(context: Context): Boolean = try {
             ContextCompat.startForegroundService(context, Intent(context, StreamService::class.java)); true

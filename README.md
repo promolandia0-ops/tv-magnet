@@ -44,4 +44,4 @@ Current `v1.0.0`: all 22 JVM tests passed, including the Robolectric app-launch 
 Dependency notices in `LICENSE-libtorrent4j.txt` and `LICENSE-NanoHTTPD.txt`. Third-party libs are requested directly from their Maven repositories, not copied from other projects.
 
 
-Current `v1.0.2`: fixes the native crash when starting playback (stale libtorrent handle from an alert), adds the two-step Buscar flow and a next-launch diagnostic from `ApplicationExitInfo`. See CRASH_INVESTIGATION_NOTES.md for what was and was not verified.
+Current `v1.0.3`: fixes "nothing plays" (prepare waited for most of the file; see CRASH_INVESTIGATION_NOTES.md). Previous `v1.0.2`: fixes the native crash when starting playback (stale libtorrent handle from an alert), adds the two-step Buscar flow and a next-launch diagnostic from `ApplicationExitInfo`. See CRASH_INVESTIGATION_NOTES.md for what was and was not verified.

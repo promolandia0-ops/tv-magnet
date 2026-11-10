@@ -72,7 +72,7 @@ class EndToEndTorrentTest {
             log("step: listed ok")
             assertNull("nothing served yet", stream.activeFile())
             Thread.sleep(3_000); shadowOf(Looper.getMainLooper()).idle()
-            assertTrue("no real download before the user picks", last()!!.downloadedBytes < 256 * 1024)
+            assertTrue("only a bounded prefetch before the user picks", last()!!.downloadedBytes < 12L * 1024 * 1024)
             log("step: idle 3s passed, downloaded=${last()!!.downloadedBytes}")
             // Step 2: choose a video, serve it over HTTP with Range.
             log("step: selecting")

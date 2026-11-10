@@ -9,8 +9,9 @@ android {
         applicationId = "com.promolandia.tvmagnet"
         minSdk = 28
         targetSdk = 35
-        versionCode = 3
-        versionName = "1.0.2"
+        versionCode = 4
+        versionName = "1.0.3"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
     signingConfigs {
         create("release") {
@@ -60,4 +61,6 @@ dependencies {
     testImplementation("xpp3:xpp3:1.1.4c")
     testImplementation("xmlpull:xmlpull:1.1.3.1")
     testImplementation("org.robolectric:robolectric:4.14.1")
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("androidx.test:runner:1.6.2")
 }

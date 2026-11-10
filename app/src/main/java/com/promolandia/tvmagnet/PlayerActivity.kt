@@ -27,6 +27,19 @@ import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.ui.PlayerView
 import com.promolandia.tvmagnet.service.StreamService
 
+/** Same player setup for the screen and for the on-device instrumentation test. */
+@OptIn(UnstableApi::class)
+object PlayerFactory {
+    fun build(context:Context,url:String,title:String,onError:(PlaybackException)->Unit={}):ExoPlayer {
+        val load=DefaultLoadControl.Builder().setBufferDurationsMs(4_000,20_000,800,2_000).setPrioritizeTimeOverSizeThresholds(true).build()
+        return ExoPlayer.Builder(context).setLoadControl(load).build().also {player->
+            player.addListener(object:Player.Listener { override fun onPlayerError(error:PlaybackException) { onError(error) } })
+            player.setMediaItem(MediaItem.Builder().setUri(url).setMimeType(mimeForName(title)).build())
+            player.prepare();player.playWhenReady=true
+        }
+    }
+}
+
 @OptIn(UnstableApi::class)
 class PlayerActivity:AppCompatActivity() {
     private var exo:ExoPlayer?=null
@@ -46,15 +59,7 @@ class PlayerActivity:AppCompatActivity() {
             setShowNextButton(false);setShowPreviousButton(false)
         }
         root.addView(video)
-        val load=DefaultLoadControl.Builder().setBufferDurationsMs(4_000,20_000,800,2_000).setPrioritizeTimeOverSizeThresholds(true).build()
-        exo=ExoPlayer.Builder(this).setLoadControl(load).build().also {player->
-            video.player=player
-            player.addListener(object:Player.Listener {
-                override fun onPlayerError(error:PlaybackException) { toast("Não consegui abrir este formato. Tente tocar na TV.") }
-            })
-            player.setMediaItem(MediaItem.Builder().setUri(intent.getStringExtra("url")).setMimeType(mimeForName(title.toString())).build())
-            player.prepare();player.playWhenReady=true
-        }
+        exo=PlayerFactory.build(this,intent.getStringExtra("url") ?:"",title.toString()) { error -> toast("Erro ao tocar: ${error.errorCodeName}. Tente tocar na TV.") }.also { video.player=it }
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         serviceBound=bindService(Intent(this,StreamService::class.java),connection,Context.BIND_IMPORTANT)
     }

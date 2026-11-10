@@ -46,6 +46,8 @@ data class StreamState(
     /** Largest video, preselected in the list; nothing streams until the user confirms. */
     val suggestedIndex: Int = -1,
     val downloadedBytes: Long = 0,
+    /** Contiguous bytes ready at the play position (what the player can read right now). */
+    val bufferedAhead: Long = 0,
     val totalBytes: Long = 0,
     val speedBytes: Long = 0,
     val peers: Int = 0,
